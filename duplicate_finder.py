@@ -35,7 +35,10 @@ from pprint import pprint
 import shutil
 from subprocess import Popen, PIPE, TimeoutExpired
 from tempfile import TemporaryDirectory
+from typing import List
 import webbrowser
+from pymongo.database import Database
+from werkzeug.routing import PathConverter
 
 from flask import Flask
 from flask_cors import CORS
@@ -50,7 +53,10 @@ import sys
 
 
 scriptDir = os.path.dirname(os.path.realpath(sys.argv[0]))
+print(f"pwd {os.getcwd()}")
+print(f"cd to {os.path.abspath(scriptDir)}")
 os.chdir(scriptDir)
+
 
 @contextmanager
 def connect_to_db(db_conn_string='./db'):
@@ -69,13 +75,15 @@ def connect_to_db(db_conn_string='./db'):
         if not os.path.isdir(db_conn_string):
             os.makedirs(db_conn_string)
 
-        p = Popen(['mongod', '--dbpath', db_conn_string], stdout=PIPE, stderr=PIPE)
+        p = Popen(['mongod', '--dbpath', db_conn_string],
+                  stdout=PIPE, stderr=PIPE)
 
         try:
             p.wait(timeout=2)
             stdout, stderr = p.communicate()
             cprint("Error starting mongod", "red")
             cprint(stdout.decode(), "red")
+            cprint(stderr.decode(), "red")
             exit()
         except TimeoutExpired:
             pass
@@ -106,11 +114,14 @@ def get_image_files(path):
         return imghdr.what(file_name)
 
     path = os.path.abspath(path)
-    for root, dirs, files in os.walk(path):
+    for root, _, files in os.walk(path):
         for file in files:
             file = os.path.join(root, file)
-            if is_image(file):
-                yield file
+            try:
+                if is_image(file):
+                    yield file
+            except OSError:
+                pass
 
 
 def hash_file(file):
@@ -123,7 +134,7 @@ def hash_file(file):
         capture_time = get_capture_time(img)
 
         # hash the image 4 times and rotate it by 90 degrees each time
-        for angle in [ 0, 90, 180, 270 ]:
+        for angle in [0, 90, 180, 270]:
             if angle > 0:
                 turned_img = img.rotate(angle, expand=True)
             else:
@@ -216,7 +227,7 @@ def same_time(dup):
     return True
 
 
-def find(db, match_time=False):
+def find(db: Database, match_time: bool = False):
     dups = db.aggregate([{
         "$group": {
             "_id": "$hash",
@@ -231,7 +242,7 @@ def find(db, match_time=False):
             }
         }
     },
-    {
+        {
         "$match": {
             "total": {"$gt": 1}
         }
@@ -243,19 +254,27 @@ def find(db, match_time=False):
     return list(dups)
 
 
-def delete_duplicates(duplicates, db):
+def delete_duplicates(duplicates: List, db: Database):
     results = [delete_picture(x['file_name'], db)
                for dup in duplicates for x in dup['items'][1:]]
     cprint("Deleted {}/{} files".format(results.count(True),
                                         len(results)), 'yellow')
 
 
-def delete_picture(file_name, db, trash="./Trash/"):
+def delete_picture(file_name: str, db: Database, trash: str = "./Trash/"):
+    if os.getcwd() != scriptDir:
+        cprint(
+            f"[WARNING] Flask bug changed directory to {os.getcwd()}", 'red')
+        cprint(f"[WARNING] changed directory back to {scriptDir}", 'yellow')
+        os.chdir(scriptDir)
+    trash = os.path.abspath(trash)
     cprint("Moving {} to {}".format(file_name, trash), 'yellow')
     if not os.path.exists(trash):
+        cprint("Creating {}".format(trash), 'yellow')
         os.makedirs(trash)
     try:
-        shutil.move(file_name, trash + os.path.basename(file_name))
+        shutil.move(file_name, os.path.join(
+            trash, os.path.basename(file_name)))
         remove_image(file_name, db)
     except FileNotFoundError:
         cprint("File not found {}".format(file_name), 'red')
@@ -267,8 +286,7 @@ def delete_picture(file_name, db, trash="./Trash/"):
     return True
 
 
-def display_duplicates(duplicates, db, trash="./Trash/"):
-    from werkzeug.routing import PathConverter
+def display_duplicates(duplicates: List, db: Database, trash: str = "./Trash/"):
     class EverythingConverter(PathConverter):
         regex = '.*?'
 
