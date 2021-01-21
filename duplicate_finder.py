@@ -39,6 +39,7 @@ from tempfile import TemporaryDirectory
 from typing import List
 import webbrowser
 from pymongo.database import Database
+from urllib.request import pathname2url
 
 from flask import Flask
 from flask_cors import CORS
@@ -304,6 +305,7 @@ def display_duplicates(duplicates: List, db: Database):
 
     def render(duplicates, current, total):
         env = Environment(loader=FileSystemLoader('template'))
+        env.filters['quote'] = lambda u: pathname2url(u)
         template = env.get_template('index.html')
         return template.render(duplicates=duplicates,
                                current=current,
