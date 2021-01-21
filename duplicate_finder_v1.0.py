@@ -29,16 +29,14 @@ Options:
 import concurrent.futures
 from contextlib import contextmanager
 import os
-import imghdr
+import magic
 import math
 from pprint import pprint
+import psutil
 import shutil
 from subprocess import Popen, PIPE, TimeoutExpired
 from tempfile import TemporaryDirectory
-from typing import List
 import webbrowser
-from pymongo.database import Database
-from werkzeug.routing import PathConverter
 
 from flask import Flask
 from flask_cors import CORS
@@ -48,14 +46,11 @@ from more_itertools import chunked
 from PIL import Image, ExifTags
 import pymongo
 from termcolor import cprint
-# fixes from https://github.com/philipbl/duplicate-images/pull/41
-import sys
 
 
-scriptDir = os.path.dirname(os.path.realpath(sys.argv[0]))
-# print(f"pwd {os.getcwd()}")
-# print(f"cd to {os.path.abspath(scriptDir)}")
-os.chdir(scriptDir)
+TRASH = "./Trash/"
+DB_PATH = "./db"
+NUM_PROCESSES = psutil.cpu_count()
 
 
 @contextmanager
@@ -64,7 +59,7 @@ def connect_to_db(db_conn_string='./db'):
 
     # Determine db_conn_string is a mongo URI or a path
     # If this is a URI
-    if 'mongodb://' == db_conn_string[:10] or 'mongodb+srv://' == db_conn_string[:14]:
+    if 'mongodb://' == db_conn_string[:10]:
         client = pymongo.MongoClient(db_conn_string)
         cprint("Connected server...", "yellow")
         db = client.image_database
@@ -75,15 +70,13 @@ def connect_to_db(db_conn_string='./db'):
         if not os.path.isdir(db_conn_string):
             os.makedirs(db_conn_string)
 
-        p = Popen(['mongod', '--dbpath', db_conn_string],
-                  stdout=PIPE, stderr=PIPE)
+        p = Popen(['mongod', '--dbpath', db_conn_string], stdout=PIPE, stderr=PIPE)
 
         try:
             p.wait(timeout=2)
             stdout, stderr = p.communicate()
             cprint("Error starting mongod", "red")
             cprint(stdout.decode(), "red")
-            cprint(stderr.decode(), "red")
             exit()
         except TimeoutExpired:
             pass
@@ -111,18 +104,21 @@ def get_image_files(path):
     :return: yield absolute path
     """
     def is_image(file_name):
-        mime = imghdr.what(file_name)
-        return mime
+        # List mime types fully supported by Pillow
+        full_supported_formats = ['gif', 'jp2', 'jpeg', 'pcx', 'png', 'tiff', 'x-ms-bmp',
+                                  'x-portable-pixmap', 'x-xbitmap']
+        try:
+            mime = magic.from_file(file_name, mime=True)
+            return mime.rsplit('/', 1)[1] in full_supported_formats
+        except IndexError:
+            return False
 
     path = os.path.abspath(path)
-    for root, _, files in os.walk(path):
+    for root, dirs, files in os.walk(path):
         for file in files:
             file = os.path.join(root, file)
-            try:
-                if is_image(file):
-                    yield file
-            except OSError:
-                pass
+            if is_image(file):
+                yield file
 
 
 def hash_file(file):
@@ -134,13 +130,20 @@ def hash_file(file):
         image_size = get_image_size(img)
         capture_time = get_capture_time(img)
 
-        # hash the image 4 times and rotate it by 90 degrees each time
-        for angle in [0, 90, 180, 270]:
-            if angle > 0:
-                turned_img = img.rotate(angle, expand=True)
-            else:
-                turned_img = img
-            hashes.append(str(imagehash.phash(turned_img)))
+        # 0 degree hash
+        hashes.append(str(imagehash.phash(img)))
+
+        # 90 degree hash
+        img = img.rotate(90, expand=True)
+        hashes.append(str(imagehash.phash(img)))
+
+        # 180 degree hash
+        img = img.rotate(90, expand=True)
+        hashes.append(str(imagehash.phash(img)))
+
+        # 270 degree hash
+        img = img.rotate(90, expand=True)
+        hashes.append(str(imagehash.phash(img)))
 
         hashes = ''.join(sorted(hashes))
 
@@ -151,8 +154,8 @@ def hash_file(file):
         return None
 
 
-def hash_files_parallel(files, num_processes=None):
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_processes) as executor:
+def hash_files_parallel(files):
+    with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_PROCESSES) as executor:
         for result in executor.map(hash_file, files):
             if result is not None:
                 yield result
@@ -181,13 +184,13 @@ def new_image_files(files, db):
             yield file
 
 
-def add(paths, db, num_processes=None):
+def add(paths, db):
     for path in paths:
         cprint("Hashing {}".format(path), "blue")
         files = get_image_files(path)
         files = new_image_files(files, db)
 
-        for result in hash_files_parallel(files, num_processes):
+        for result in hash_files_parallel(files):
             _add_to_database(*result, db=db)
 
         cprint("...done", "blue")
@@ -228,7 +231,7 @@ def same_time(dup):
     return True
 
 
-def find(db: Database, match_time: bool = False):
+def find(db, match_time=False):
     dups = db.aggregate([{
         "$group": {
             "_id": "$hash",
@@ -243,7 +246,7 @@ def find(db: Database, match_time: bool = False):
             }
         }
     },
-        {
+    {
         "$match": {
             "total": {"$gt": 1}
         }
@@ -255,27 +258,19 @@ def find(db: Database, match_time: bool = False):
     return list(dups)
 
 
-def delete_duplicates(duplicates: List, db: Database):
+def delete_duplicates(duplicates, db):
     results = [delete_picture(x['file_name'], db)
                for dup in duplicates for x in dup['items'][1:]]
     cprint("Deleted {}/{} files".format(results.count(True),
                                         len(results)), 'yellow')
 
 
-def delete_picture(file_name: str, db: Database, trash: str = "./Trash/"):
-    if os.getcwd() != scriptDir:
-        cprint(
-            f"[WARNING] Flask bug changed directory to {os.getcwd()}", 'red')
-        cprint(f"[WARNING] changed directory back to {scriptDir}", 'yellow')
-        os.chdir(scriptDir)
-    trash = os.path.abspath(trash)
-    cprint("Moving {} to {}".format(file_name, trash), 'yellow')
-    if not os.path.exists(trash):
-        cprint("Creating {}".format(trash), 'yellow')
-        os.makedirs(trash)
+def delete_picture(file_name, db):
+    cprint("Moving {} to {}".format(file_name, TRASH), 'yellow')
+    if not os.path.exists(TRASH):
+        os.makedirs(TRASH)
     try:
-        shutil.move(file_name, os.path.join(
-            trash, os.path.basename(file_name)))
+        shutil.move(file_name, TRASH + os.path.basename(file_name))
         remove_image(file_name, db)
     except FileNotFoundError:
         cprint("File not found {}".format(file_name), 'red')
@@ -287,7 +282,8 @@ def delete_picture(file_name: str, db: Database, trash: str = "./Trash/"):
     return True
 
 
-def display_duplicates(duplicates: List, db: Database, trash: str = "./Trash/"):
+def display_duplicates(duplicates, db):
+    from werkzeug.routing import PathConverter
     class EverythingConverter(PathConverter):
         regex = '.*?'
 
@@ -306,7 +302,7 @@ def display_duplicates(duplicates: List, db: Database, trash: str = "./Trash/"):
         # Generate all of the HTML files
         chunk_size = 25
         for i, dups in enumerate(chunked(duplicates, chunk_size)):
-            with open('{}/{}.html'.format(folder, i), 'w', encoding='utf-8') as f:
+            with open('{}/{}.html'.format(folder, i), 'w') as f:
                 f.write(render(dups,
                                current=i,
                                total=math.ceil(len(duplicates) / chunk_size)))
@@ -314,8 +310,8 @@ def display_duplicates(duplicates: List, db: Database, trash: str = "./Trash/"):
         webbrowser.open("file://{}/{}".format(folder, '0.html'))
 
         @app.route('/picture/<everything:file_name>', methods=['DELETE'])
-        def delete_picture_(file_name, trash=trash):
-            return str(delete_picture(file_name, db, trash))
+        def delete_picture_(file_name):
+            return str(delete_picture(file_name, db))
 
         app.run()
 
@@ -349,22 +345,16 @@ if __name__ == '__main__':
 
     if args['--trash']:
         TRASH = args['--trash']
-    else:
-        TRASH = "./Trash/"
 
     if args['--db']:
         DB_PATH = args['--db']
-    else:
-        DB_PATH = "./db"
 
     if args['--parallel']:
         NUM_PROCESSES = int(args['--parallel'])
-    else:
-        NUM_PROCESSES = None
 
     with connect_to_db(db_conn_string=DB_PATH) as db:
         if args['add']:
-            add(args['<path>'], db, NUM_PROCESSES)
+            add(args['<path>'], db)
         elif args['remove']:
             remove(args['<path>'], db)
         elif args['clear']:
