@@ -28,8 +28,8 @@ Options:
 
 import concurrent.futures
 from contextlib import contextmanager
+import imghdr
 import os
-import magic
 import math
 from pprint import pprint
 import psutil
@@ -107,11 +107,8 @@ def get_image_files(path):
         # List mime types fully supported by Pillow
         full_supported_formats = ['gif', 'jp2', 'jpeg', 'pcx', 'png', 'tiff', 'x-ms-bmp',
                                   'x-portable-pixmap', 'x-xbitmap']
-        try:
-            mime = magic.from_file(file_name, mime=True)
-            return mime.rsplit('/', 1)[1] in full_supported_formats
-        except IndexError:
-            return False
+        mime = imghdr.what(file_name)
+        return mime in full_supported_formats
 
     path = os.path.abspath(path)
     for root, dirs, files in os.walk(path):
