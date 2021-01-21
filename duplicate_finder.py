@@ -164,7 +164,7 @@ def hash_files_parallel(files):
             if result is not None:
                 yield result
 
-
+# TODO: batch commit
 def _add_to_database(file_, hash_, file_size, image_size, capture_time, db):
     try:
         db.insert_one({"_id": file_,
@@ -176,8 +176,9 @@ def _add_to_database(file_, hash_, file_size, image_size, capture_time, db):
         cprint("Duplicate key: {}".format(file_), "red")
 
 
+# TODO: batch read
 def _in_database(file, db):
-    return db.count({"_id": file}) > 0
+    return db.count_documents({"_id": file}) > 0
 
 
 def new_image_files(files, db):
@@ -218,7 +219,7 @@ def clear(db):
 
 
 def show(db):
-    total = db.count()
+    total = db.count_documents()
     pprint(list(db.find()))
     print("Total: {}".format(total))
 
