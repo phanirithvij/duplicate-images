@@ -7,7 +7,7 @@ Usage:
     duplicate_finder.py remove <path> ... [--db=<db_path>]
     duplicate_finder.py clear [--db=<db_path>]
     duplicate_finder.py show [--db=<db_path>]
-    duplicate_finder.py find [--print] [--delete] [--match-time] [--trash=<trash_path>] [--db=<db_path>]
+    duplicate_finder.py find [--print] [--delete] [--match-time] [--trash=<trash_path>] [--db=<db_path>] [--threshold=<num>]
     duplicate_finder.py -h | --help
 
 Options:
@@ -19,6 +19,7 @@ Options:
                                files (default: number of CPUs).
 
     find:
+        --threshold=<num>     Image matching threshold. Number of different bits in Hamming distance. False positives are possible.
         --print               Only print duplicate files rather than displaying HTML file
         --delete              Move all found duplicate pictures to the trash. This option takes priority over --print.
         --match-time          Adds the extra constraint that duplicate images must have the
@@ -48,6 +49,7 @@ from jinja2 import FileSystemLoader, Environment
 from more_itertools import chunked
 from PIL import Image, ExifTags
 import pymongo
+import pybktree
 from termcolor import cprint
 # fixes from https://github.com/philipbl/duplicate-images/pull/41
 import sys
@@ -165,6 +167,8 @@ def hash_files_parallel(files):
                 yield result
 
 # TODO: batch commit
+
+
 def _add_to_database(file_, hash_, file_size, image_size, capture_time, db):
     try:
         db.insert_one({"_id": file_,
@@ -241,6 +245,7 @@ def find(db: Database, match_time: bool = False):
         "$group": {
             "_id": "$hash",
             "total": {"$sum": 1},
+            "file_size": {"$max": "$file_size"},
             "items": {
                 "$push": {
                     "file_name": "$_id",
@@ -252,15 +257,64 @@ def find(db: Database, match_time: bool = False):
         }
     },
         {
-        "$match": {
-            "total": {"$gt": 1}
-        }
-    }])
+            "$match": {
+                "total": {"$gt": 1}
+            }
+    },
+        {"$sort": {"file_size": -1}}
+    ])
 
     if match_time:
         dups = (d for d in dups if same_time(d))
 
     return list(dups)
+
+
+def find_threshold(db, threshold=1):
+    dups = []
+    # Build a tree
+    cursor = db.find()
+    tree = pybktree.BKTree(pybktree.hamming_distance)
+
+    print('Finding fuzzy duplicates, it might take a while...', threshold)
+    cnt = 0
+    for document in db.find():
+        int_hash = int(document['hash'], 16)
+        tree.add(int_hash)
+        cnt = cnt + 1
+
+    deduplicated = set()
+
+    scanned = 0
+    for document in db.find():
+        cprint("\r%d%%" % (scanned * 100 / (cnt - 1)), end='')
+        scanned = scanned + 1
+        if document['hash'] in deduplicated:
+            continue
+        deduplicated.add(document['hash'])
+        hash_len = len(document['hash'])
+        int_hash = int(document['hash'], 16)
+        similar = tree.find(int_hash, threshold)
+        similar = list(set(similar))
+        if len(similar) > 1:
+            similars = []
+            for (distance, item_hash) in similar:
+                # if distance > 0:
+                item_hash = format(item_hash, '0' + str(hash_len) + 'x')
+                deduplicated.add(item_hash)
+                for item in db.find({'hash': item_hash}):
+                    item['file_name'] = item['_id']
+                    similars.append(item)
+            if len(similars) > 0:
+                dups.append(
+                    {
+                        '_id': document['hash'],
+                        'total': len(similars),
+                        'items': similars
+                    }
+                )
+
+    return dups
 
 
 def delete_duplicates(duplicates: List, db: Database):
@@ -297,6 +351,7 @@ def delete_picture(file_name: str, db: Database):
 
 def display_duplicates(duplicates: List, db: Database):
     from werkzeug.routing import PathConverter
+
     class EverythingConverter(PathConverter):
         regex = '.*?'
 
@@ -376,12 +431,15 @@ if __name__ == '__main__':
         elif args['show']:
             show(db)
         elif args['find']:
-            dups = find(db, args['--match-time'])
+            if args['--threshold'] is not None:
+                dups = find_threshold(db, int(args['--threshold']))
+            else:
+                dups = find(db, args['--match-time'])
 
             if args['--delete']:
                 delete_duplicates(dups, db)
             elif args['--print']:
-                pprint(dups)
+                # pprint(dups)
                 print("Number of duplicates: {}".format(len(dups)))
             else:
                 display_duplicates(dups, db=db)
